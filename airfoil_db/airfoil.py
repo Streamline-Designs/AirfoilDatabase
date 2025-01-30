@@ -6,6 +6,7 @@ import copy
 import os
 import operator
 import warnings
+import shutil
 
 import matplotlib.pyplot as plt
 import scipy.interpolate as interp
@@ -23,7 +24,7 @@ class Airfoil:
     The parameters "camber_relaxation", "le_loc", and "camber_termination_tol" then
     have bearing on this solver.
 
-    When using the member methods get_CL, get_CD, get_Cm, get_CLa, get_CLM, get_CLRe,
+    When using the member methods get_CL, get_CD, get_Cm, get_Chinge, get_CLa, get_CLM, get_CLRe,
     and get_aL0, the default parameters are dependent upon the type of airfoil.
 
     For all airfoil types except 'functional', 'alpha', 'trailing_flap_deflection',
@@ -71,10 +72,13 @@ class Airfoil:
 
     max_iterations : int, optional
         Maximum number of iterations for the camber line solver. Defaults to 100.
+
+    xfoil_timeout : int, optional
+        Timeout in seconds for xfoil to complete one alpha sweep. Defaults to 5 sec per alpha condition.
     """
 
     def __init__(self, name, airfoil_input, **kwargs):
-        
+        self._db_lookup = np.array([])
         self.name = name
         self._load_params(airfoil_input)
         if "camber_solver_kwargs" in list(self._input_dict.keys()):
@@ -90,6 +94,7 @@ class Airfoil:
             self._le_loc = kwargs.get("le_loc", None)
             self._camber_termination_tol = kwargs.get("camber_termination_tol", 1e-10)
             self._max_iterations = kwargs.get("max_iterations", 100)
+        self._xfoil_timeout = kwargs.get("xfoil_timeout", 5)
 
         # Load flaps
         self._load_flaps()
@@ -110,10 +115,11 @@ class Airfoil:
         # Load input file
         input_file = self._input_dict.get("input_file", None)
         if input_file is not None:
-            if self._type == "database":
-                self.import_database(filename=input_file)
-            elif self._type == "poly_fit":
-                self.import_polynomial_fits(filename=input_file)
+            if os.path.exists(input_file):
+                if self._type == "database":
+                    self.import_database(filename=input_file)
+                elif self._type == "poly_fit":
+                    self.import_polynomial_fits(filename=input_file)
 
 
         self._raise_poly_bounds_error = True
@@ -164,7 +170,7 @@ class Airfoil:
                 self._type = database_type
 
         # Check for database
-        if database_type == "database":
+        elif database_type == "database":
             if not hasattr(self, "_data"):
                 raise RuntimeWarning("Airfoil {0} does not have a database of coefficients. Reverting to type '{1}' for computations.".format(self.name, self._type))
             else:
@@ -195,14 +201,14 @@ class Airfoil:
                 self._dof_defaults["Mach"] = 0.5*(M_max+M_min)
 
         # Check for polynomial fits
-        if database_type == "poly_fit":
+        elif database_type == "poly_fit":
             if not hasattr(self, "_CL_poly_coefs"):
                 raise RuntimeWarning("Airfoil {0} does not have a set of polynomial fits. Reverting to type '{1}' for computations.".format(self.name, self._type))
             else:
                 self._type = database_type
 
         # Check for functional definition
-        if database_type == "functional":
+        elif database_type == "functional":
             if not hasattr(self, "_CL"):
                 raise RuntimeWarning("Airfoil {0} does not have functional definitions of coefficients. Reverting to type '{1}' for computations.".format(self.name, self._type))
             else:
@@ -225,24 +231,25 @@ class Airfoil:
         self._type = self._input_dict.get("type", "linear")
 
         # If linear, store coefficients
-        if self._type == "linear":
-            self._aL0 = self._input_dict.get("aL0", 0.0)
-            self._CLa = self._input_dict.get("CLa", 2*np.pi)
-            self._Cma = self._input_dict.get("Cma", 0.0)
-            self._CD0 = self._input_dict.get("CD0", 0.0)
-            self._CD1 = self._input_dict.get("CD1", 0.0)
-            self._CD2 = self._input_dict.get("CD2", 0.0)
-            self._CL_max = self._input_dict.get("CL_max", np.inf)
-            if abs(self._CL_max) < 1e-10:
-                warnings.warn("You have specified a maximum lift coefficient of 0. Are you sure you want to do this?...")
-            self._CmL0 = self._input_dict.get("CmL0", 0.0)
+        self._aL0 = self._input_dict.get("aL0", 0.0)
+        self._CLa = self._input_dict.get("CLa", 2*np.pi)
+        self._Cma = self._input_dict.get("Cma", 0.0)
+        self._Chingea = self._input_dict.get("Chingea", 0.0)
+        self._CD0 = self._input_dict.get("CD0", 0.0)
+        self._CD1 = self._input_dict.get("CD1", 0.0)
+        self._CD2 = self._input_dict.get("CD2", 0.0)
+        self._CL_max = self._input_dict.get("CL_max", np.inf)
+        if abs(self._CL_max) < 1e-10:
+            warnings.warn("You have specified a maximum lift coefficient of 0. Are you sure you want to do this?...")
+        self._CmL0 = self._input_dict.get("CmL0", 0.0)
+        self.ChingeL0 = self._input_dict.get("ChingeL0", 0.0)
 
         # For functional, store functions
-        elif self._type == "functional":
+        if self._type == "functional":
             self._CL = self._input_dict["CL"]
             self._CD = self._input_dict["CD"]
             self._Cm = self._input_dict["Cm"]
-
+            self._Chinge = self._input_dict["Chinge"]
 
     def _load_flaps(self):
         # Loads flaps based on the input dict
@@ -783,7 +790,7 @@ class Airfoil:
 
     def _get_database_data(self, data_index, **kwargs):
         # Returns an interpolated data point from the database.
-        # data_index: 0 = CL, 1 = CD, 2 = Cm
+        # data_index: 0 = CL, 1 = CD, 2 = Cm, 3 = Chinge
 
         # Determine size of query
         max_size = 1
@@ -792,13 +799,26 @@ class Airfoil:
             if isinstance(param, np.ndarray):
                 max_size = max(max_size, param.shape[0])
 
-        # Get params
-        param_vals = np.zeros((max_size,self._num_dofs))
+        # Get params - don't keep reallocating memory unless needed
+        if self._db_lookup.shape[0] < max_size or self._db_lookup.shape[1] < self._num_dofs:
+            self._db_lookup = np.zeros((max_size,self._num_dofs))
         for i, dof in enumerate(self._dof_db_order):
-            param_vals[:,i] = kwargs.get(dof, self._dof_defaults[dof])
+            self._db_lookup[:max_size,i] = np.clip(kwargs.get(dof, self._dof_defaults[dof])
+                                / self._data_norms.flatten()[i], a_min=-1.0, a_max=1.0)
 
+        # Use regular grid interpolator if possible since it is faster
+        if len(self._regular_grid_interpolator) > 0:
+            try:
+                return self._regular_grid_interpolator[data_index](self._db_lookup[:max_size,:self._num_dofs])
+            except Exception as e:
+                i = int(e.args[0].split()[-1])
+                dof = self._dof_db_order[i]
+                print(f"Error: {self.name} database out of bounds. {dof} range: "
+                      + f"[{np.min(kwargs.get(dof, self._dof_defaults[dof])):.4g} ... "
+                      + f"{np.max(kwargs.get(dof, self._dof_defaults[dof])):.4g}]")
+        else:
         # Interpolate
-        return_val = interp.griddata(self._normed_ind_vars, self._data[:,self._num_dofs+data_index].flatten(), param_vals/self._data_norms, method='linear').flatten()
+            return_val = interp.griddata(self._normed_ind_vars, self._data[:,self._num_dofs+data_index].flatten(), self._db_lookup[:max_size,:self._num_dofs], method='linear').flatten()
         #return_val = interp.griddata(self._data[:,:self._num_dofs], self._data[:,self._num_dofs+data_index].flatten(), param_vals, method='linear').flatten()
 
         # Check for going out of bounds
@@ -986,6 +1006,63 @@ class Airfoil:
         return Cm
 
 
+    def get_Chinge(self, **kwargs):
+        """Returns the hinge moment coefficient. note: all parameters can be given as numpy arrays, in which case a numpy array of the coefficient will be returned.
+        to do this, all parameter arrays must have only one dimension and must have the same length.
+
+        Parameters
+        ----------
+        alpha : float, optional
+            Angle of attack in radians. Defaults to 0.0.
+
+        Rey : float, optional
+            Reynolds number.
+
+        Mach : float, optional
+            Mach number.
+
+        trailing_flap_deflection : float, optional
+            Trailing flap deflection in radians. Defaults to 0.
+
+        trailing_flap_moment_deriv : float or ndarray, optional
+            Change in section moment with respect to trailing flap deflection. Defaults to 0.
+
+        trailing_flap_fraction : float, optional
+            Trailing flap fraction of the chord length. Defaults to 0.
+
+        Returns
+        -------
+        float or ndarray
+            Moment coefficient
+        """
+        # Adjust for flap deflection
+        d_f = kwargs.get("trailing_flap_deflection", 0.0)
+        c_f = kwargs.get("trailing_flap_fraction", 0.0)
+        theta_f = np.arccos(2.0*c_f-1.0)
+        Chinge_df = 0.25*(np.sin(2.0*theta_f)-2.0*np.sin(theta_f))
+
+        # Linear type
+        if self._type == "linear":
+
+            # Get parameters
+            alpha = kwargs.get("alpha", 0.0)
+            Chinge = 0.
+
+        # Functional model
+        elif self._type == "functional":
+            Chinge = self._Chinge(**kwargs)
+
+        # Generated/imported database
+        elif self._type == "database":
+            Chinge = self._get_database_data(3, **kwargs)
+
+        # Fits
+        elif self._type == "poly_fit":
+            Chinge = self._get_polynomial_data(3, **kwargs)
+
+        return Chinge
+    
+
     def get_aL0(self, **kwargs):
         """Returns the zero-lift angle of attack, taking flap deflection into account.
 
@@ -1025,9 +1102,23 @@ class Airfoil:
             
             return aL0
 
+        # Database
+        # Some CL curves with large flap deflections never cross CL=0
+        # Find CL at alpha=0, CLa at alpha=0, and follow a line to CL=0
+        elif self._type == "database":
+
+            # Remove alpha from kwargs
+            kwargs.pop('alpha', None)
+            CL0 = self.get_CL(alpha=0.0, **kwargs)
+            CLa0 = self.get_CLa(alpha=0.0, **kwargs)
+            if np.any(np.abs(CLa0) < 1e-6):
+                raise ValueError("A lift curve slope at alpha=0 is near 0")
+            else:
+                return -CL0 / CLa0
+
         # Database/poly fit/functional
         # Use secant method in alpha to find a_L0
-        elif self._type == "database" or self._type == "poly_fit" or self._type == "functional":
+        elif self._type == "poly_fit" or self._type == "functional":
 
             # Remove alpha from kwargs
             kwargs.pop('alpha', None)
@@ -1648,7 +1739,7 @@ class Airfoil:
 
 
     def generate_database(self, **kwargs):
-        """Makes calls to Xfoil to calculate CL, CD, and Cm as a function of each given degree of freedom.
+        """Makes calls to Xfoil to calculate CL, CD, Cm, Chinge as a function of each given degree of freedom.
 
         Parameters
         ----------
@@ -1753,6 +1844,15 @@ class Airfoil:
 
         verbose : bool, optional
             Defaults to True
+
+        save_outline_points : str, optional
+            If a string is provided, the outline points for each trailing_edge_deflection will
+            be saved. The string should be formatted like: <path><file>.<ext>. If a string such as
+            "analysis/naca2412.dat" is provided and trailing edge deflection is excluded from the dof, the
+            "analysis/naca2412.dat" will be saved (and overwritten if the function is called again). If
+            trailing edge deflections are included in the dof, the saved files may be "analysis/naca2412_-0.154.dat",
+            "analysis/naca2412_0.000.dat", and "analysis/naca2412_0.154.dat".
+            Defaults to None.
         """
 
         # Set up lists of independent vars
@@ -1769,11 +1869,11 @@ class Airfoil:
                 self._dof_db_cols[dof] = column_index
 
         # Get coefficients
-        CL, CD, Cm = self.run_xfoil(**xfoil_args, **kwargs)
+        CL, CD, Cm, Chinge = self.run_xfoil(**xfoil_args, **kwargs)
 
         # Determine the rows and cols in the database; each independent var and coefficient is a column to be iterpolated using scipy.interpolate.griddata
         self._num_dofs = len(list(self._dof_db_cols.keys()))
-        num_cols = 3+self._num_dofs
+        num_cols = 4+self._num_dofs
         num_rows = CL.size-np.count_nonzero(np.isnan(CL))
         dof_sorted = sorted(self._dof_db_cols.items(), key=operator.itemgetter(1))
         self._dof_db_order = [x[0] for x in dof_sorted]
@@ -1811,6 +1911,7 @@ class Airfoil:
                             self._data[database_row,self._num_dofs] = CL[i,j,k,l,m]
                             self._data[database_row,self._num_dofs+1] = CD[i,j,k,l,m]
                             self._data[database_row,self._num_dofs+2] = Cm[i,j,k,l,m]
+                            self._data[database_row,self._num_dofs+3] = Chinge[i,j,k,l,m]
 
                             database_row += 1
 
@@ -1885,6 +1986,7 @@ class Airfoil:
             header.append("{:<25s}".format('CL'))
             header.append("{:<25s}".format('CD'))
             header.append("{:<25s}".format('Cm'))
+            header.append("{:<25s}".format('Chinge'))
             header = " ".join(header)
 
             # Export
@@ -1935,6 +2037,25 @@ class Airfoil:
         # Update type
         if kwargs.get("update_type", True):
             self.set_type("database")
+
+        # Create a regular grid interpolator for quick table look-up - requires no missing points on DOE
+        points = []
+        lengths = []
+        sort_criteria = ()
+        self._regular_grid_interpolator = []
+        for _, value in self._dof_db_cols.items():
+            p = np.unique(self._data[:,value]) / self._data_norms.flatten()[value]
+            sort_criteria = (self._data[:,value] / self._data_norms.flatten()[value],) + sort_criteria
+            points.append(p)
+            lengths.append(len(p))
+        if self._data.shape[0] == np.prod(lengths):  # require a regular grid shape
+            sort_indices = np.lexsort(sort_criteria)  # Sort by column 0, then 1, then 2
+            sorted_data = self._data[sort_indices]
+            for icol in range(self._num_dofs, self._data.shape[1]):
+                vals = sorted_data[:,icol].reshape(tuple(lengths))
+                self._regular_grid_interpolator.append(
+                    interp.RegularGridInterpolator(points, vals, method='linear',
+                    bounds_error=True, fill_value=np.nan))
 
 
     def run_xfoil(self, **kwargs):
@@ -1995,6 +2116,15 @@ class Airfoil:
 
         verbose : bool, optional
 
+        save_outline_points : str, optional
+            If a string is provided, the outline points for each trailing_edge_deflection will
+            be saved. The string should be formatted like: <path><file>.<ext>. If a string such as
+            "analysis/naca2412.dat" is provided and trailing edge deflection is excluded from the dof, the
+            "analysis/naca2412.dat" will be saved (and overwritten if the function is called again). If
+            trailing edge deflections are included in the dof, the saved files may be "analysis/naca2412_-0.154.dat",
+            "analysis/naca2412_0.000.dat", and "analysis/naca2412_0.154.dat".
+            Defaults to None.
+
         Returns
         -------
         CL : ndarray
@@ -2005,6 +2135,9 @@ class Airfoil:
 
         Cm : ndarray
             Moment coefficient. Dimensions same as CL.
+
+        Chinge : ndarray
+            Hinge moment coefficient. Dimensions samse as CL.
         """
         N = kwargs.get("N", 200)
         max_iter = kwargs.get("max_iter", 100)
@@ -2054,9 +2187,11 @@ class Airfoil:
         CL = np.empty((first_dim, second_dim, third_dim, fourth_dim, fifth_dim))
         CD = np.empty((first_dim, second_dim, third_dim, fourth_dim, fifth_dim))
         Cm = np.empty((first_dim, second_dim, third_dim, fourth_dim, fifth_dim))
+        Chinge = np.empty((first_dim, second_dim, third_dim, fourth_dim, fifth_dim))
         CL[:] = np.nan
         CD[:] = np.nan
         Cm[:] = np.nan
+        Chinge[:] = np.nan
 
         # Clean up from previous iterations
         dir_list = os.listdir()
@@ -2081,6 +2216,13 @@ class Airfoil:
                 outline_points = "a_{0:1.6f}_{1:1.6f}.geom".format(delta_ft, c_ft)
                 #outline_points = os.path.abspath("xfoil_geom_{0:1.6f}.geom".format(delta_ft))
                 self.get_outline_points(N=N, trailing_flap_deflection=delta_ft, trailing_flap_fraction=c_ft, export=outline_points, close_te=False)
+                fname = kwargs.get("save_outline_points", None)
+                if fname is not None:
+                    if len(delta_fts) > 1:
+                        fpart, ext = os.path.splitext(fname)
+                        shutil.copy2(outline_points, f"{fpart}_{np.degrees(delta_ft):0.1f}{ext}")
+                    else:
+                        shutil.copy2(outline_points, fname)
 
                 # Display update
                 if verbose:
@@ -2089,128 +2231,155 @@ class Airfoil:
 
                 # Loop through Reynolds number
                 for Re in Reys:
+                    commands = []
 
-                    # Initialize xfoil execution
-                    with sp.Popen(['xfoil'], stdin=sp.PIPE, stdout=sp.PIPE) as xfoil_process:
+                    # Turn off plots
+                    if not kwargs.get("show_xfoil_plots", True):
+                        commands += ['PLOP',
+                                        'G',
+                                        '']
+                    elif resize_xfoil_window != None:
+                        commands += ['PLOP',
+                                        'W {}'.format(resize_xfoil_window),
+                                        '']
 
-                        commands = []
+                    # Read in geometry
+                    commands += ['LOAD {0}'.format(outline_points),
+                                    '{0}'.format(self.name)]
 
-                        # Turn off plots
-                        if not kwargs.get("show_xfoil_plots", True):
-                            commands += ['PLOP',
-                                         'G',
-                                         '']
-                        elif resize_xfoil_window != None:
-                            commands += ['PLOP',
-                                         'W {}'.format(resize_xfoil_window),
-                                         '']
+                    # Set panelling ratio and let Xfoil make its own panels
+                    # This throws a fortran error if the plots are turned off with Xfoil 6.99
+                    commands += ['PPAR',
+                                    'N',
+                                    '{0}'.format(N),
+                                    'T',
+                                    '1',
+                                    '',
+                                    '']
 
-                        # Read in geometry
-                        commands += ['LOAD {0}'.format(outline_points),
-                                     '{0}'.format(self.name)]
+                    # Set moment reference point
+                    commands += ['XYCM',
+                                    str(xycm[0]),
+                                    str(xycm[1])]
 
-                        # Set panelling ratio and let Xfoil make its own panels
-                        # This throws a fortran error if the plots are turned off with Xfoil 6.99
-                        commands += ['PPAR',
-                                     'N',
-                                     '{0}'.format(N),
-                                     'T',
-                                     '1',
-                                     '',
-                                     '']
+                    # Set viscous mode (if desired)
+                    if kwargs.get("visc", True):
+                        commands += ['OPER',
+                                        'VISC',
+                                        '']
 
-                        # Set moment reference point
-                        commands += ['XYCM',
-                                     str(xycm[0]),
-                                     str(xycm[1])]
+                        # Set boundary layer parameters
+                        commands += ['VPAR',
+                                        'Xtr',
+                                        str(x_trip[0]),
+                                        str(x_trip[1]),
+                                        'N',
+                                        str(N_crit),
+                                        '',
+                                        '']
+                        
+                    # Export hinge moments
+                    commands += ['OPER',
+                                    'HINC',
+                                    f'FNEW {str(1-.2)} 0',
+                                    'FMOM',
+                                    '']
 
-                        # Set viscous mode (if desired)
+                    # Initialize PACC index
+                    pacc_index = 0
+
+                    # Loop through Mach numbers
+                    for M in Machs:
+
+                        # Polar accumulation file
+                        file_id += 1
+                        pacc_file = "xfoil_results_{0}.pacc".format(file_id)
+                        pacc_files.append(pacc_file)
+
+                        # Set Mach, Reynolds number, iteration limit, polar accumulation, and flap hinge location
                         if kwargs.get("visc", True):
                             commands += ['OPER',
-                                         'VISC',
-                                         '']
+                                        'RE',
+                                        str(Re),
+                                        'MACH',
+                                        str(M),
+                                        'ITER {0}'.format(max_iter),
+                                        'PACC',
+                                        pacc_file,
+                                        '']
 
-                            # Set boundary layer parameters
-                            commands += ['VPAR',
-                                         'Xtr',
-                                         str(x_trip[0]),
-                                         str(x_trip[1]),
-                                         'N',
-                                         str(N_crit),
-                                         '',
-                                         '']
+                        else:
+                            commands += ['OPER',
+                                        'MACH',
+                                        str(M),
+                                        'ITER {0}'.format(max_iter),
+                                        'PACC',
+                                        pacc_file,
+                                        '']
 
-                        # Initialize PACC index
-                        pacc_index = 0
+                        # Sweep angle of attack
+                        if len(alphas) == 1:
+                            commands.append('ALFA {0:1.6f}'.format(math.degrees(alphas[0])))
 
-                        # Loop through Mach numbers
-                        for M in Machs:
-
-                            # Polar accumulation file
-                            file_id += 1
-                            pacc_file = "xfoil_results_{0}.pacc".format(file_id)
-                            pacc_files.append(pacc_file)
-
-                            # Set Mach, Reynolds number, iteration limit, and polar accumulation
-                            if kwargs.get("visc", True):
-                                commands += ['OPER',
-                                            'RE',
-                                            str(Re),
-                                            'MACH',
-                                            str(M),
-                                            'ITER {0}'.format(max_iter),
-                                            'PACC',
-                                            pacc_file,
-                                            '']
-                            else:
-                                commands += ['OPER',
-                                            'MACH',
-                                            str(M),
-                                            'ITER {0}'.format(max_iter),
-                                            'PACC',
-                                            pacc_file,
-                                            '']
-
-                            # Sweep angle of attack
-                            if len(alphas) == 1:
-                                commands.append('ALFA {0:1.6f}'.format(math.degrees(alphas[0])))
-
-                            else:
-                                # Sweep from 0 aoa up
-                                zero_ind = np.argmin(np.abs(alphas))
-                                if zero_ind != len(alphas)-1:
-                                    for a in alphas[zero_ind:]:
-                                        commands.append('ALFA {0:1.6f}'.format(math.degrees(a)))
-                            
-                                # Reset solver
-                                commands.append('INIT')
-
-                                # Sweep from 0 aoa down
-                                if zero_ind != 0:
-                                    for a in alphas[zero_ind-1::-1]:
-                                        commands.append('ALFA {0:1.6f}'.format(math.degrees(a)))
-                            
+                        else:
+                            # Sweep from 0 aoa up
+                            zero_ind = np.argmin(np.abs(alphas))
+                            if zero_ind != len(alphas)-1:
+                                for a in alphas[zero_ind:]:
+                                    commands.append('ALFA {0:1.6f}'.format(math.degrees(a)))
+                        
                             # Reset solver
                             commands.append('INIT')
 
-                            # End polar accumulation
-                            commands += ['PACC {0}'.format(pacc_index),
-                                         '']
-                            pacc_index += 1
+                            # Sweep from 0 aoa down
+                            if zero_ind != 0:
+                                for a in alphas[zero_ind-1::-1]:
+                                    commands.append('ALFA {0:1.6f}'.format(math.degrees(a)))
+                        
+                        # Reset solver
+                        commands.append('INIT')
 
-                        # Finish commands
-                        commands += ['',
-                                     'QUIT']
+                        # End polar accumulation
+                        commands += ['PACC {0}'.format(pacc_index),
+                                        '']
+                        pacc_index += 1
 
-                        # Run Xfoil
-                        xfoil_input = '\r'.join(commands).encode('utf-8')
-                        response = xfoil_process.communicate(xfoil_input)
+                    # Finish commands
+                    commands += ['',
+                                    'QUIT']
+                    
 
-                        # Show output
-                        if show_xfoil_output:
-                            print(response[0].decode('utf-8'))
-                            if response[1] is not None:
-                                print(response[1].decode('utf-8'))
+                    commands_cp = commands
+
+                    # Initialize and execute xfoil. Reduce boundary layer (NCRIT) to try to get difficult cases to converge
+                    # TODO: Don't retry if in inviscid mode
+                    min_retry = int(N_crit) - 3
+                    for attempt in range(int(N_crit), min_retry, -1):
+                        xtr_found = False
+                        for i, command in enumerate(commands):
+                            if command == "Xtr":
+                                xtr_found = True
+                            elif xtr_found and command == "N":
+                                commands_cp[i+1] = str(attempt)
+                                break
+
+                        try:
+                            xfoil_process = sp.Popen(['xfoil'], stdin=sp.PIPE, stdout=sp.PIPE)
+                            xfoil_input = '\r'.join(commands_cp).encode('utf-8')
+                            response = xfoil_process.communicate(xfoil_input, timeout=len(alphas) * self._xfoil_timeout)
+                            break  # no more restart attempts needed
+
+                        except sp.TimeoutExpired:
+                            xfoil_process.kill()
+                            print(f"ERROR, XFOIL failed on: NCRIT={attempt}, Re={Re:.3g}, M={M:.2g}, geometry={outline_points}")
+                            if attempt > min_retry:
+                                print(f"Retrying with NCRIT={attempt-1} ...")
+
+                    # Show output
+                    if show_xfoil_output:
+                        print(response[0].decode('utf-8'))
+                        if response[1] is not None:
+                            print(response[1].decode('utf-8'))
 
                 # Clean up geometry
                 os.remove(outline_points)
@@ -2220,7 +2389,7 @@ class Airfoil:
 
                     # Read in file
                     try:
-                        alpha_i, CL_i, CD_i, Cm_i, Re_i, M_i = self.read_pacc_file(filename, CD_type=kwargs.get('CD_type', 'total'))
+                        alpha_i, CL_i, CD_i, Cm_i, Chinge_i, Re_i, M_i = self.read_pacc_file(filename, CD_type=kwargs.get('CD_type', 'total'))
                     except FileNotFoundError:
                         warnings.warn("Couldn't find results file {0}. Usually an indication of Xfoil crashing.".format(filename))
                         continue
@@ -2240,22 +2409,24 @@ class Airfoil:
                         CL[i_true,j,k,l,m] = CL_i[i_iter]
                         CD[i_true,j,k,l,m] = CD_i[i_iter]
                         Cm[i_true,j,k,l,m] = Cm_i[i_iter]
+                        Chinge[i_true,j,k,l,m] = Chinge_i[i_iter]
 
-                    # Interpolate missing values
-                    for i, alpha in enumerate(alpha_i):
-                        if np.isnan(CL[i,j,k,l,m]): # Result did not converge
+                    # # Interpolate missing values
+                    # for i, alpha in enumerate(alpha_i):
+                    #     if np.isnan(CL[i,j,k,l,m]): # Result did not converge
 
-                            # Mid-value
-                            if i != 0 and i != len(alpha_i)-1:
-                                weight = (alpha_i[i+1]-alpha)/(alpha_i[i+1]-alpha_i[i-1])
-                                CL[i,j,k,l,m] = CL[i-1,j,k,l,m]*(1-weight)+CL[i+1,j,k,l,m]*weight
-                                CD[i,j,k,l,m] = CD[i-1,j,k,l,m]*(1-weight)+CD[i+1,j,k,l,m]*weight
-                                Cm[i,j,k,l,m] = Cm[i-1,j,k,l,m]*(1-weight)+Cm[i+1,j,k,l,m]*weight
+                    #         # Mid-value
+                    #         if i != 0 and i != len(alpha_i)-1:
+                    #             weight = (alpha_i[i+1]-alpha)/(alpha_i[i+1]-alpha_i[i-1])
+                    #             CL[i,j,k,l,m] = CL[i-1,j,k,l,m]*(1-weight)+CL[i+1,j,k,l,m]*weight
+                    #             CD[i,j,k,l,m] = CD[i-1,j,k,l,m]*(1-weight)+CD[i+1,j,k,l,m]*weight
+                    #             Cm[i,j,k,l,m] = Cm[i-1,j,k,l,m]*(1-weight)+Cm[i+1,j,k,l,m]*weight
+                    #             Chinge[i,j,k,l,m] = Chinge[i-1,j,k,l,m]*(1-weight)+Chinge[i+1,j,k,l,m]*weight
 
                     # Clean up polar files
                     os.remove(filename)
 
-        return CL, CD, Cm
+        return CL, CD, Cm, Chinge
 
 
     def read_pacc_file(self, filename, CD_type='total'):
@@ -2284,6 +2455,9 @@ class Airfoil:
         Cm : list
             Moment coefficient at each alpha.
 
+        Chinge : list
+            Hinge moment coefficient at each alpha.
+    
         Re : float
             Reynolds number for the polar.
 
@@ -2311,6 +2485,7 @@ class Airfoil:
         CL = []
         CD = []
         Cm = []
+        Chinge = []
         for line in lines[12:]:
             split_line = line.split()
             alpha.append(math.radians(float(split_line[0])))
@@ -2322,6 +2497,7 @@ class Airfoil:
             elif CD_type=='friction':
                 CD.append(float(split_line[2])-float(split_line[3]))
             Cm.append(float(split_line[4]))
+            Chinge.append(float(split_line[5]))
 
         # Sort in alpha
         sorted_indices = np.argsort(alpha)
@@ -2329,8 +2505,9 @@ class Airfoil:
         CL = np.array(CL)[sorted_indices]
         CD = np.array(CD)[sorted_indices]
         Cm = np.array(Cm)[sorted_indices]
+        Chinge = np.array(Chinge)[sorted_indices]
 
-        return alpha, CL, CD, Cm, Re, M
+        return alpha, CL, CD, Cm, Chinge, Re, M
 
 
     def _create_filled_database(self):
@@ -2357,6 +2534,7 @@ class Airfoil:
         filled_CL = np.zeros(tuple(shape))
         filled_CD = np.zeros(tuple(shape))
         filled_Cm = np.zeros(tuple(shape))
+        filled_Chinge = np.zeros(tuple(shape))
         N = filled_CL.size
 
         # Create grid of independent vars
@@ -2374,7 +2552,8 @@ class Airfoil:
         filled_CD_view[:] = self.get_CD(**params)
         filled_Cm_view = filled_Cm.reshape(N)
         filled_Cm_view[:] = self.get_Cm(**params)
-
+        filled_Chinge_view = filled_Chinge.reshape(N)
+        filled_Chinge_view[:] = self.get_Chinge(**params)
         # Huh. Turns out I don't actually need this, so I'm not going to bother developing it further. But I'll keep it here in case it becomes useful
 
 
@@ -2408,6 +2587,9 @@ class Airfoil:
         Cm_degrees : dict, optional
             Same as CL_degrees.
 
+        Chinge_degrees : dict, optional
+            Same as CL_degrees.
+    
         CL_kwargs : dict, optional
             keyword arguments sent to the CL polynomial fit function
             
@@ -2484,6 +2666,9 @@ class Airfoil:
         Cm_kwargs : dict, optional
             Same as CL_kwargs
 
+        Chinge_kwargs : dict, optional
+            Same as Chinge_kwargs
+
         update_type : bool, optional
             Whether to update the airfoil to use the newly computed polynomial fits for calculations. Defaults to True.
 
@@ -2498,14 +2683,17 @@ class Airfoil:
         CL_degrees = kwargs.pop("CL_degrees", {})
         CD_degrees = kwargs.pop("CD_degrees", {})
         Cm_degrees = kwargs.pop("Cm_degrees", {})
+        Chinge_degrees = kwargs.pop("Cm_degrees", {})
         CL_kwargs  = kwargs.pop("CL_kwargs", {})
         CD_kwargs  = kwargs.pop("CD_kwargs", {})
         Cm_kwargs  = kwargs.pop("Cm_kwargs", {})
+        Chinge_kwargs  = kwargs.pop("Chinge_kwargs", {})
         verbose = kwargs.pop('verbose', True)
         if verbose: print('Generating Polynomial Fits for airfoil {}'.format(self.name))
         CL_kwargs['verbose'] = verbose
         CD_kwargs['verbose'] = verbose
         Cm_kwargs['verbose'] = verbose
+        Chinge_kwargs['verbose'] = verbose
 
         # CL
         if verbose: print('Performing CL curve fit')
@@ -2558,6 +2746,21 @@ class Airfoil:
             # Generate polynomial fit
             self._Cm_poly_coefs, self._Cmfit_R2 = multivariablePolynomialFit(self._Cm_degrees, self._data[:,:self._num_dofs], self._data[:, self._num_dofs+2], **Cm_kwargs)
 
+        # Chinge
+        if verbose: print('Performing Chinge curve fit')
+        if Chinge_degrees=="auto":
+            self._Chinge_poly_coefs, self._Chinge_degrees, self._Chingefit_R2 = autoPolyFit(self._data[:,:self._num_dofs], self._data[:,self._num_dofs+3], **Chinge_kwargs)
+
+        elif isinstance(Cm_degrees, dict):
+
+            # Sort fit degrees
+            self._Chinge_degrees = []
+            for dof in self._dof_db_order:
+                self._Chinge_degrees.append(Chinge_degrees.get(dof, 1))
+
+            # Generate polynomial fit
+            self._Chinge_poly_coefs, self._Chingefit_R2 = multivariablePolynomialFit(self._Chinge_degrees, self._data[:,:self._num_dofs], self._data[:, self._num_dofs+3], **Chinge_kwargs)
+
         # Store limits
         self._dof_limits = []
         for i in range(self._num_dofs):
@@ -2570,6 +2773,7 @@ class Airfoil:
         self._CLfit_RMS, self._CLfit_RMSN = multivariableRMS(self._data[:,:self._num_dofs], self._data[:,self._num_dofs], self._CL_poly_coefs, self._CL_degrees, verbose=verbose)
         self._CDfit_RMS, self._CDfit_RMSN = multivariableRMS(self._data[:,:self._num_dofs], self._data[:,self._num_dofs+1], self._CD_poly_coefs, self._CD_degrees, verbose=verbose)
         self._Cmfit_RMS, self._Cmfit_RMSN = multivariableRMS(self._data[:,:self._num_dofs], self._data[:,self._num_dofs+2], self._Cm_poly_coefs, self._Cm_degrees, verbose=verbose)
+        self._Chingefit_RMS, self._Chingefit_RMSN = multivariableRMS(self._data[:,:self._num_dofs], self._data[:,self._num_dofs+2], self._Chinge_poly_coefs, self._Chinge_degrees, verbose=verbose)
         
         if verbose:
             print('\nCL fits\n'+'='*20)
@@ -2584,6 +2788,10 @@ class Airfoil:
             print('R^2 : {}'.format(self._Cmfit_R2))
             print('RMS : {}'.format(self._Cmfit_RMS))
             print('RMSN: {}\n'.format(self._Cmfit_RMSN))
+            print('Chinge fits\n'+'='*20)
+            print('R^2 : {}'.format(self._Chingefit_R2))
+            print('RMS : {}'.format(self._Chingefit_RMS))
+            print('RMSN: {}\n'.format(self._Chingefit_RMSN))
 
 
     def export_polynomial_fits(self, **kwargs):
@@ -2614,6 +2822,7 @@ class Airfoil:
         export["fit_degrees"]["CL"] = self._CL_degrees
         export["fit_degrees"]["CD"] = self._CD_degrees
         export["fit_degrees"]["Cm"] = self._Cm_degrees
+        export["fit_degrees"]["Chinge"] = self._Chinge_degrees
         export['fit_error'] = {}
         export['fit_error']['CL'] = {}
         export['fit_error']['CL']['R^2'] = self._CLfit_R2
@@ -2627,10 +2836,15 @@ class Airfoil:
         export['fit_error']['Cm']['R^2'] = self._Cmfit_R2
         export['fit_error']['Cm']['RMS'] = self._Cmfit_RMS
         export['fit_error']['Cm']['RMSN'] = self._Cmfit_RMSN
+        export['fit_error']['Chinge'] = {}
+        export['fit_error']['Chinge']['R^2'] = self._Chingefit_R2
+        export['fit_error']['Chinge']['RMS'] = self._Chingefit_RMS
+        export['fit_error']['Chinge']['RMSN'] = self._Chingefit_RMSN
         export["fit_coefs"] = {}
         export["fit_coefs"]["CL"] = list(self._CL_poly_coefs)
         export["fit_coefs"]["CD"] = list(self._CD_poly_coefs)
         export["fit_coefs"]["Cm"] = list(self._Cm_poly_coefs)
+        export["fit_coefs"]["Chinge"] = list(self._Chinge_poly_coefs)
 
         # Export data
         with open(filename, 'w') as export_file_handle:
@@ -2664,9 +2878,11 @@ class Airfoil:
         self._CL_degrees = input_dict["fit_degrees"]["CL"]
         self._CD_degrees = input_dict["fit_degrees"]["CD"]
         self._Cm_degrees = input_dict["fit_degrees"]["Cm"]
+        self._Chinge_degrees = input_dict["fit_degrees"]["Chinge"]
         self._CL_poly_coefs = np.array(input_dict["fit_coefs"]["CL"])
         self._CD_poly_coefs = np.array(input_dict["fit_coefs"]["CD"])
         self._Cm_poly_coefs = np.array(input_dict["fit_coefs"]["Cm"])
+        self._Chinge_poly_coefs = np.array(input_dict["fit_coefs"]["Chinge"])
         if isinstance(input_dict.get('fit_error', None), dict):
             if isinstance(input_dict['fit_error'].get('CL', None), dict):
                 self._CLfit_R2 = input_dict['fit_error']['CL'].get('R^2', None)
@@ -2680,6 +2896,10 @@ class Airfoil:
                 self._Cmfit_R2 = input_dict['fit_error']['Cm'].get('R^2', None)
                 self._Cmfit_RMS = input_dict['fit_error']['Cm'].get('RMS', None)
                 self._Cmfit_RMSN = input_dict['fit_error']['Cm'].get('RMSN', None)
+            if isinstance(input_dict['fit_error'].get('Chinge', None), dict):
+                self._Chingefit_R2 = input_dict['fit_error']['Chinge'].get('R^2', None)
+                self._Chingefit_RMS = input_dict['fit_error']['Chinge'].get('RMS', None)
+                self._Chingefit_RMSN = input_dict['fit_error']['Chinge'].get('RMSN', None)
 
         # Update type
         if kwargs.get("update_type", True):
@@ -2692,6 +2912,7 @@ class Airfoil:
         #   0        |  CL
         #   1        |  CD
         #   2        |  Cm
+        #   3        |  Chinge
 
         # Stack up independent vars
         ind_vars = []
@@ -2730,6 +2951,8 @@ class Airfoil:
             coef = multivariablePolynomialFunction(self._CD_poly_coefs, self._CD_degrees, x)
         elif coef_index == 2:
             coef = multivariablePolynomialFunction(self._Cm_poly_coefs, self._Cm_degrees, x)
+        elif coef_index == 3:
+            coef = multivariablePolynomialFunction(self._Chinge_poly_coefs, self._Chinge_degrees, x)
 
         # Check limits
         if self._raise_poly_bounds_error:
@@ -2783,11 +3006,13 @@ class Airfoil:
         CL = np.zeros(30)
         Cm = np.zeros(30)
         CD = np.zeros(30)
+        Chinge = np.zeros(30)
         for i, a in enumerate(alpha):
             try:
                 CL[i] = self.get_CL(alpha=np.radians(a), **kwargs)
                 Cm[i] = self.get_Cm(alpha=np.radians(a), **kwargs)
                 CD[i] = self.get_CD(alpha=np.radians(a), **kwargs)
+                Chinge[i] = self.get_Chinge(alpha=np.radians(a), **kwargs)
             except DatabaseBoundsError:
                 continue
 
@@ -2828,6 +3053,7 @@ class Airfoil:
             CL = CL[self._selected_ind[0]:self._selected_ind[1]+1]
             Cm = Cm[self._selected_ind[0]:self._selected_ind[1]+1]
             CD = CD[self._selected_ind[0]:self._selected_ind[1]+1]
+            Chinge = Chinge[self._selected_ind[0]:self._selected_ind[1]+1]
 
         else:
             alpha = np.radians(alpha)
@@ -2849,12 +3075,17 @@ class Airfoil:
         self._CD1 = coef_array[1]
         self._CD2 = coef_array[0]
 
+        # Get Chinge model
+        coef_array = np.polyfit(alpha, Chinge, 1)
+        self._Chingea = coef_array[0]
+        self._ChingeL0 = self._Chingea*self._aL0+coef_array[1]
+
         # Plot model within linear region
         if kwargs.get("plot_model", False):
 
             # CL
             plt.close('all')
-            fig, (ax0, ax1, ax2) = plt.subplots(nrows=1, ncols=3)
+            fig, (ax0, ax1, ax2, ax3) = plt.subplots(nrows=1, ncols=4)
             fig.suptitle("Linear Model for {0}".format(self.name))
             ax0.set_title("CL")
             ax0.plot(alpha, CL, "gx", label="Data")
@@ -2878,6 +3109,14 @@ class Airfoil:
             ax2.legend()
             ax2.set_xlabel("Lift Coefficient")
             ax2.set_ylabel("Drag Coefficient")
+
+            # Chinge
+            ax3.set_title("Chinge")
+            ax3.plot(alpha, Chinge, 'gx', label="Data")
+            ax3.plot(alpha, (alpha-self._aL0)*self._Chingea+self._ChingeL0, "g-", label="Model")
+            ax3.legend()
+            ax3.set_xlabel("Angle of Attack [rad]")
+            ax3.set_ylabel("Hinge Moment Coefficient")
             plt.show()
 
         # Update type
@@ -2904,6 +3143,8 @@ class Airfoil:
             "CLa" : self._CLa,
             "CmL0" : self._CmL0,
             "Cma" : self._Cma,
+            "ChingeL0" : self._ChingeL0,
+            "Chingea" : self._Chingea,
             "CD0" : self._CD0,
             "CD1" : self._CD1,
             "CD2" : self._CD2,
@@ -2911,6 +3152,8 @@ class Airfoil:
         }
 
         # Export
-        filename = kwargs.get("filename")
-        with open(filename, 'w') as export_file_handle:
-            json.dump(model_dict, export_file_handle, indent=4)
+        filename = kwargs.get("filename", None)
+        if filename is not None:
+            with open(filename, 'w') as export_file_handle:
+                json.dump(model_dict, export_file_handle, indent=4)
+        return model_dict
