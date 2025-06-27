@@ -804,10 +804,11 @@ class Airfoil:
             self._db_lookup = np.zeros((max_size,self._num_dofs))
         for i, dof in enumerate(self._dof_db_order):
             self._db_lookup[:max_size,i] = np.clip(kwargs.get(dof, self._dof_defaults[dof])
-                                / self._data_norms.flatten()[i], a_min=-1.0, a_max=1.0)
+                                / self._data_norms.flatten()[i], a_min=-2.0, a_max=2.0)
 
         # Use regular grid interpolator if possible since it is faster
         if len(self._regular_grid_interpolator) > 0:
+            return_val = None
             try:
                 return self._regular_grid_interpolator[data_index](self._db_lookup[:max_size,:self._num_dofs])
             except Exception as e:
@@ -816,6 +817,7 @@ class Airfoil:
                 print(f"Error: {self.name} database out of bounds. {dof} range: "
                       + f"[{np.min(kwargs.get(dof, self._dof_defaults[dof])):.4g} ... "
                       + f"{np.max(kwargs.get(dof, self._dof_defaults[dof])):.4g}]")
+                raise RuntimeError("Cannot complete airfoil database look-up")
         else:
         # Interpolate
             return_val = interp.griddata(self._normed_ind_vars, self._data[:,self._num_dofs+data_index].flatten(), self._db_lookup[:max_size,:self._num_dofs], method='linear').flatten()
@@ -880,6 +882,11 @@ class Airfoil:
                     CL = np.where((CL > self._CL_max) | (CL < -self._CL_max), np.sign(CL)*self._CL_max, CL)
                 elif CL > self._CL_max or CL < -self._CL_max:
                     CL = np.sign(CL)*self._CL_max
+
+            # Apply influence of flaps after saturating
+            if not (np.array(d_f == 0.0).all() or np.array(c_f == 0.0).all()):
+                delta_a_d_f = self._get_flap_influence(c_f, d_f)
+                CL += self._CLa*delta_a_d_f
 
         # Functional model
         elif self._type == "functional":
@@ -1853,6 +1860,11 @@ class Airfoil:
             trailing edge deflections are included in the dof, the saved files may be "analysis/naca2412_-0.154.dat",
             "analysis/naca2412_0.000.dat", and "analysis/naca2412_0.154.dat".
             Defaults to None.
+
+        save_cp : str, optional
+            If a string is provided for a valid path/filename, saves Cp vs x and y of the airfoil for
+            each alpha. The string XFOIL output from CPWR is combined into a single tabular file. Defaults
+            to None.
         """
 
         # Set up lists of independent vars
@@ -2125,6 +2137,11 @@ class Airfoil:
             "analysis/naca2412_0.000.dat", and "analysis/naca2412_0.154.dat".
             Defaults to None.
 
+        save_cp : str, optional
+            If a string is provided for a valid path/filename, saves Cp vs x and y of the airfoil for
+            each alpha. The string XFOIL output from CPWR is combined into a single tabular file. Defaults
+            to None.
+
         Returns
         -------
         CL : ndarray
@@ -2183,6 +2200,13 @@ class Airfoil:
         # xfoil window resizing
         resize_xfoil_window = kwargs.get('resize_xfoil_window', None)
 
+        # Cp save
+        save_cp = kwargs.get("save_cp", None)
+        if save_cp is not None:
+            cp_path, cp_file = os.path.split(save_cp)
+            if cp_path != "":  cp_path += "/"
+            cp_fname, cp_ext = os.path.splitext(cp_file)
+
         # Initialize coefficient arrays
         CL = np.empty((first_dim, second_dim, third_dim, fourth_dim, fifth_dim))
         CD = np.empty((first_dim, second_dim, third_dim, fourth_dim, fifth_dim))
@@ -2220,7 +2244,7 @@ class Airfoil:
                 if fname is not None:
                     if len(delta_fts) > 1:
                         fpart, ext = os.path.splitext(fname)
-                        shutil.copy2(outline_points, f"{fpart}_{np.degrees(delta_ft):0.1f}{ext}")
+                        shutil.copy2(outline_points, f"{fpart}_{np.degrees(delta_ft):0.1f}_{c_ft:1.6f}{ext}")
                     else:
                         shutil.copy2(outline_points, fname)
 
@@ -2320,6 +2344,8 @@ class Airfoil:
                         # Sweep angle of attack
                         if len(alphas) == 1:
                             commands.append('ALFA {0:1.6f}'.format(math.degrees(alphas[0])))
+                            if save_cp is not None:
+                                commands.append(f'CPWR {cp_fname}_{M:1.3f}_{Re:1.3e}_{math.degrees(alphas[0]):2.1f}{cp_ext}')
 
                         else:
                             # Sweep from 0 aoa up
@@ -2327,6 +2353,8 @@ class Airfoil:
                             if zero_ind != len(alphas)-1:
                                 for a in alphas[zero_ind:]:
                                     commands.append('ALFA {0:1.6f}'.format(math.degrees(a)))
+                                    if save_cp is not None:
+                                        commands.append(f'CPWR {cp_fname}_{M:1.3f}_{Re:1.3e}_{math.degrees(a):2.1f}{cp_ext}')
                         
                             # Reset solver
                             commands.append('INIT')
@@ -2335,6 +2363,9 @@ class Airfoil:
                             if zero_ind != 0:
                                 for a in alphas[zero_ind-1::-1]:
                                     commands.append('ALFA {0:1.6f}'.format(math.degrees(a)))
+                                    if save_cp is not None:
+                                        commands.append(f'CPWR {cp_fname}_{M:1.3f}_{Re:1.3e}_{math.degrees(a):2.1f}{cp_ext}')
+
                         
                         # Reset solver
                         commands.append('INIT')
@@ -2425,6 +2456,51 @@ class Airfoil:
 
                     # Clean up polar files
                     os.remove(filename)
+
+                # Combine Cp files
+                if save_cp is not None:
+                    # delta_ft, c_ft
+                    cp = None
+                    i = 0
+                    for Re in Reys:
+                        for M in Machs:
+                            for alpha in alphas:
+                                fname = f'{cp_fname}_{M:1.3f}_{Re:1.3e}_{math.degrees(alpha):2.1f}{cp_ext}'
+                                try:
+                                    # Typical file
+                                    arr = np.loadtxt(fname, skiprows=3)
+                                    os.remove(fname)
+                                except:
+                                    # Either file doesn't exist or it is missing a space between columns
+                                    try:
+                                        from io import StringIO
+                                        f = open(fname, 'r')
+                                        lines = f.read().splitlines()
+                                        f.close()
+                                        data = "\n".join(lines[3:])
+                                        number= r'([+\-]?(?:0|[1-9]\d*)(?:\.\d+)?(?:[eE][+\-]?\d+)?)'
+                                        opt_whitespace = r'\s*'
+                                        pattern = (opt_whitespace + number + opt_whitespace + number
+                                                   + opt_whitespace + number)
+                                        data_type = np.dtype(','.join(['f8']*3))
+                                        arr = np.fromregex(StringIO(data), pattern, dtype=data_type)
+                                        arr = np.array(arr.tolist())
+                                        os.remove(fname)
+                                    except:
+                                        continue  # file must not exist
+                                num_pts = arr.shape[0]
+                                if cp is None:
+                                    cp = np.zeros((len(Reys) * len(Machs) * len(alphas)
+                                                    * arr.shape[0],6))
+                                cp[i:i+num_pts,0] = Re
+                                cp[i:i+num_pts,1] = M
+                                cp[i:i+num_pts,2] = np.degrees(alpha)
+                                cp[i:i+num_pts,3] = arr[:,0]
+                                cp[i:i+num_pts,4] = arr[:,1]
+                                cp[i:i+num_pts,5] = arr[:,2]
+                                i += num_pts
+                    np.savetxt(f'{cp_path}{cp_fname}_{np.degrees(delta_ft):0.1f}_{c_ft:1.6f}{cp_ext}',
+                            cp[:i,:], delimiter=",", header="Re,M,alpha,x,y,Cp", fmt="%.6g")
 
         return CL, CD, Cm, Chinge
 
