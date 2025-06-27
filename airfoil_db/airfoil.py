@@ -870,11 +870,7 @@ class Airfoil:
             c_f = kwargs.get("trailing_flap_fraction", 0.0)
 
             # Calculate lift coefficient
-            if np.array(d_f == 0.0).all() or np.array(c_f == 0.0).all():
-                CL = self._CLa*(alpha-self._aL0)
-            else:
-                delta_a_d_f = self._get_flap_influence(c_f, d_f)
-                CL = self._CLa*(alpha-self._aL0+delta_a_d_f)
+            CL = self._CLa*(alpha-self._aL0)
             
             # Saturate
             with np.errstate(invalid='ignore'):
@@ -934,8 +930,11 @@ class Airfoil:
         if self._type == "linear":
             d_f = kwargs.pop("trailing_flap_deflection", 0.0)
             CL = self.get_CL(**kwargs)
-            CD_flap = 0.002*np.abs(np.degrees(d_f)) # A *very* rough estimate for flaps
-            CD = self._CD0+self._CD1*CL+self._CD2*CL**2+CD_flap
+            if np.array(d_f == 0.0).all():
+                CD = self._CD0+self._CD1*CL+self._CD2*CL**2
+            else:
+                CD_flap = 0.002*np.abs(np.degrees(d_f)) # A *very* rough estimate for flaps
+                CD = self._CD0+self._CD1*CL+self._CD2*CL**2+CD_flap
 
         # Functional model
         elif self._type == "functional":
@@ -1031,9 +1030,6 @@ class Airfoil:
         trailing_flap_deflection : float, optional
             Trailing flap deflection in radians. Defaults to 0.
 
-        trailing_flap_moment_deriv : float or ndarray, optional
-            Change in section moment with respect to trailing flap deflection. Defaults to 0.
-
         trailing_flap_fraction : float, optional
             Trailing flap fraction of the chord length. Defaults to 0.
 
@@ -1044,16 +1040,10 @@ class Airfoil:
         """
         # Adjust for flap deflection
         d_f = kwargs.get("trailing_flap_deflection", 0.0)
-        c_f = kwargs.get("trailing_flap_fraction", 0.0)
-        theta_f = np.arccos(2.0*c_f-1.0)
-        Chinge_df = 0.25*(np.sin(2.0*theta_f)-2.0*np.sin(theta_f))
 
         # Linear type
         if self._type == "linear":
-
-            # Get parameters
-            alpha = kwargs.get("alpha", 0.0)
-            Chinge = 0.
+            Chinge = 0.0
 
         # Functional model
         elif self._type == "functional":
