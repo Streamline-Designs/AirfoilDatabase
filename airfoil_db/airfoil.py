@@ -785,7 +785,7 @@ class Airfoil:
         eps_flap_ideal = 1.0-(theta_f-np.sin(theta_f))/np.pi
         hinge_eff = 3.9598*np.arctan((c_f+0.006527)*89.2574+4.898015)-5.18786
         flap_eff = np.where(np.abs(d_f)>0.19198621771937624, -0.4995016675499485*np.abs(d_f)+1.09589743589744, 1.0)
-        return hinge_eff*flap_eff*eps_flap_ideal*d_f
+        return hinge_eff*flap_eff*eps_flap_ideal*d_f*0.8  # decrease by 20% since assuming unsealed flaps (Figure 1.7.4)
 
 
     def _get_database_data(self, data_index, **kwargs):
