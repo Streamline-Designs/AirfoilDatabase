@@ -995,7 +995,7 @@ class Airfoil:
             else:
                 theta_f = np.arccos(2.0*c_f-1.0)
                 Cm_df = 0.25*(np.sin(2.0*theta_f)-2.0*np.sin(theta_f))
-                Cm = self._CmL0+self._Cma*(alpha-self._aL0)+Cm_df*d_f
+                Cm = self._CmL0+self._Cma*(alpha-self._aL0)-Cm_df*d_f
 
         # Functional model
         elif self._type == "functional":
