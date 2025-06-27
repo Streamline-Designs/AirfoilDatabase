@@ -2057,7 +2057,7 @@ class Airfoil:
                 vals = sorted_data[:,icol].reshape(tuple(lengths))
                 self._regular_grid_interpolator.append(
                     interp.RegularGridInterpolator(points, vals, method='linear',
-                    bounds_error=True, fill_value=np.nan))
+                    bounds_error=False, fill_value=None))
 
 
     def run_xfoil(self, **kwargs):
